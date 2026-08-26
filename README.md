@@ -51,7 +51,7 @@ This Gmail MCP server turns any MCP-compatible AI client into a full-featured em
 - **Gmail search syntax.** Use Gmail's query language: `is:unread`, `from:`, `newer_than:7d`, `has:attachment`, and more.
 - **Auto-unsubscribe.** Finds and triggers unsubscribe links automatically. Supports List-Unsubscribe headers, mailto links, and body link scanning.
 - **Batch operations.** Fetch batches of emails for AI-powered triage and bulk actions.
-- **Secure by design.** OAuth 2.0 authentication, AES-256-GCM encrypted token storage, minimal Gmail scopes.
+- **Secure by design.** The `/mcp` endpoint is protected by OAuth 2.1 (PKCE) — only clients you approve with the admin password can use it. AES-256-GCM encrypted token storage, minimal Gmail scopes.
 - **Deploy anywhere.** Railway, Docker, or your own server.
 
 ---
@@ -104,9 +104,17 @@ This Gmail MCP server turns any MCP-compatible AI client into a full-featured em
 | `GOOGLE_CLIENT_ID` | Your OAuth Client ID |
 | `GOOGLE_CLIENT_SECRET` | Your OAuth Client Secret |
 | `ENCRYPTION_KEY` | Any random string (32+ characters) |
-| `ADMIN_PASSWORD` | Password for the setup page |
+| `ADMIN_PASSWORD` | Long random password. It guards the setup page **and** approves MCP clients, so treat it like an API key (`openssl rand -base64 24`) |
 | `SERVER_URL` | Your Railway app URL (e.g., `https://your-app.railway.app`) |
 | `PORT` | `3000` |
+
+Optional:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AUTH_SECRET` | `ENCRYPTION_KEY` | Signs OAuth tokens and admin sessions. Change it to instantly invalidate every connected client |
+| `ALLOWED_REDIRECT_HOSTS` | `claude.ai,claude.com` | Comma-separated hosts allowed as OAuth redirect targets. Add `localhost` for MCP Inspector, or your client's callback host for other tools |
+| `TRUST_PROXY` | `true` | Set to `false` if the server is not behind a reverse proxy |
 
 3. Generate a domain in Railway (Service → Settings → Networking → Generate Domain)
 4. Update `SERVER_URL` with the generated domain
@@ -156,9 +164,11 @@ docker run -p 3000:3000 \
 3. Fill in:
    - **Name**: `Gmail` (or any name you prefer)
    - **Remote MCP server URL**: `https://your-server-url/mcp`
-   - Leave OAuth fields blank
-4. Click **Add**
+   - Leave OAuth fields blank (the server supports dynamic client registration)
+4. Click **Add**, then **Connect**. Claude opens your server's authorization page — enter your `ADMIN_PASSWORD` and click **Allow**
 5. Start a new conversation and try: *"List my connected Gmail accounts"*
+
+Nobody can use the `/mcp` endpoint without completing that step, and the authorization page only accepts redirects back to `claude.ai` / `claude.com` (see `ALLOWED_REDIRECT_HOSTS`).
 
 ---
 
@@ -176,6 +186,8 @@ Add to your Cursor MCP settings (`.cursor/mcp.json`):
 }
 ```
 
+Cursor will open the server's authorization page in your browser the first time — enter your `ADMIN_PASSWORD`. Cursor's OAuth callback runs on `localhost`, so set `ALLOWED_REDIRECT_HOSTS=claude.ai,claude.com,localhost` on the server.
+
 ---
 
 ## How to Connect Gmail MCP Server to Windsurf
@@ -191,6 +203,8 @@ Add to your Windsurf MCP configuration:
   }
 }
 ```
+
+Like Cursor, Windsurf completes OAuth via a `localhost` callback — add `localhost` to `ALLOWED_REDIRECT_HOSTS` and approve with your `ADMIN_PASSWORD` when the browser opens.
 
 ---
 
@@ -233,7 +247,7 @@ Try it: *"Find newsletters from the last month and unsubscribe from all of them"
 | [Windsurf](https://codeium.com/windsurf) | Supported | MCP configuration |
 | [Cline](https://github.com/cline/cline) | Supported | MCP settings |
 | [Continue](https://continue.dev) | Supported | MCP configuration |
-| Any MCP-compatible client | Supported | Point to the `/mcp` endpoint |
+| Any MCP-compatible client | Supported | Point to the `/mcp` endpoint (client must support OAuth 2.1 with dynamic client registration; add its callback host to `ALLOWED_REDIRECT_HOSTS`) |
 
 ---
 
@@ -243,9 +257,11 @@ Try it: *"Find newsletters from the last month and unsubscribe from all of them"
 AI Agent / Assistant (Claude, OpenClaw, Cursor, Windsurf, Cline)
   ↓ MCP Protocol (Streamable HTTP)
 Gmail MCP Server (Railway / Self-hosted / Docker)
-  ├── /mcp             MCP endpoint (tools)
-  ├── /setup           Admin page (add/remove accounts)
-  ├── /oauth/callback  Google OAuth callback
+  ├── /mcp             MCP endpoint (tools) — requires OAuth bearer token
+  ├── /authorize       OAuth 2.1 consent page (admin password) + /token, /register,
+  │                    /.well-known/oauth-* discovery
+  ├── /setup           Admin page (add/remove accounts) — cookie session
+  ├── /oauth/callback  Google OAuth callback (admin session + signed state)
   └── Token Store      Encrypted refresh tokens
         ↓
 Gmail API (per-account OAuth tokens)
@@ -255,12 +271,17 @@ Gmail API (per-account OAuth tokens)
 
 ## Security
 
+- **Protected MCP endpoint.** `/mcp` requires an OAuth 2.1 access token. Tokens are only issued after you approve a client with `ADMIN_PASSWORD` on the server's consent page; PKCE (S256) is mandatory and authorization codes are single-use and short-lived
+- **Restricted client registration.** Dynamic registration is open (the Claude connector needs it), but redirect URIs must point at `ALLOWED_REDIRECT_HOSTS`, so a stranger cannot register a client that would receive your authorization codes
+- **Stateless, revocable tokens.** Access (1h) and refresh (30d) tokens are HMAC-signed with `AUTH_SECRET` (defaults to `ENCRYPTION_KEY`) — nothing to persist across redeploys; rotate the secret to disconnect every client at once
+- **No secrets in URLs.** The admin password is never placed in a query string; `/setup` uses an HttpOnly, SameSite cookie session, and the Google OAuth `state` is a signed nonce bound to that session
+- **Brute-force protection.** Password forms are limited to 10 attempts per 15 minutes per IP; `/mcp` and the OAuth endpoints are rate-limited too
 - **OAuth 2.0** for authentication with Google
 - **AES-256-GCM** encrypted refresh token storage
 - **Minimal scopes** using only `gmail.readonly` and `gmail.modify`
 - **No passwords stored.** Your Gmail password never touches the server
-- **Password-protected setup.** The `/setup` page requires admin authentication
 - **Revocable anytime** from [Google Account Permissions](https://myaccount.google.com/permissions)
+- `/health` returns only `{"status":"ok"}`; every other route is either authenticated or a standard OAuth discovery endpoint
 
 ---
 
@@ -306,7 +327,7 @@ PRs are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 - **MCP SDK**: [@modelcontextprotocol/sdk](https://github.com/modelcontextprotocol/typescript-sdk)
 - **Gmail API**: [googleapis](https://github.com/googleapis/google-api-nodejs-client)
 - **HTTP**: Express 5
-- **Auth**: Google OAuth 2.0
+- **Auth**: Google OAuth 2.0 (Gmail access), OAuth 2.1 + PKCE authorization server (MCP clients)
 
 ---
 

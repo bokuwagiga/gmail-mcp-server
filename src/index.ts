@@ -1,20 +1,61 @@
-import express, { Request, Response, NextFunction } from "express";
+import express, { Request, Response } from "express";
+import { rateLimit } from "express-rate-limit";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { google } from "googleapis";
 import { z } from "zod";
 import { GmailService } from "./gmail-service.js";
 import { TokenStore } from "./token-store.js";
+import {
+  GmailMcpAuthProvider,
+  SESSION_COOKIE,
+  clearSessionCookie,
+  escapeHtml,
+  getAdminSession,
+  readCookie,
+  renderLoginPage,
+  requireAdminSession,
+  safeEqual,
+  setSessionCookie,
+} from "./auth.js";
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    console.error(`Missing required environment variable: ${name}`);
+    process.exit(1);
+  }
+  return value;
+}
+
 const PORT = parseInt(process.env.PORT || "3000", 10);
-const SERVER_URL = process.env.SERVER_URL || `http://localhost:${PORT}`;
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID!;
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET!;
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD!;
+const SERVER_URL = (process.env.SERVER_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
+const MCP_URL = new URL("/mcp", SERVER_URL);
+const GOOGLE_CLIENT_ID = requireEnv("GOOGLE_CLIENT_ID");
+const GOOGLE_CLIENT_SECRET = requireEnv("GOOGLE_CLIENT_SECRET");
+const ADMIN_PASSWORD = requireEnv("ADMIN_PASSWORD");
+const ENCRYPTION_KEY = requireEnv("ENCRYPTION_KEY");
+// Signs OAuth tokens / admin sessions. Falls back to ENCRYPTION_KEY so existing
+// deployments need no new variable; set AUTH_SECRET to rotate tokens independently.
+const AUTH_SECRET = process.env.AUTH_SECRET || ENCRYPTION_KEY;
+// Hosts allowed to receive OAuth redirects (i.e. which MCP clients may connect).
+const ALLOWED_REDIRECT_HOSTS = (process.env.ALLOWED_REDIRECT_HOSTS || "claude.ai,claude.com")
+  .split(",")
+  .map((h) => h.trim().toLowerCase())
+  .filter(Boolean);
+const TRUST_PROXY = process.env.TRUST_PROXY === "false" ? false : 1;
+const SECURE_COOKIES = SERVER_URL.startsWith("https://");
+
+if (ADMIN_PASSWORD.length < 12) {
+  console.warn("[config] ADMIN_PASSWORD is shorter than 12 characters — it now guards MCP access, use a long random value.");
+}
+
 const SCOPES = [
   "https://www.googleapis.com/auth/gmail.readonly",
   "https://www.googleapis.com/auth/gmail.modify",
@@ -339,53 +380,107 @@ function createMcpServer(): McpServer {
 // ---------------------------------------------------------------------------
 
 const app = express();
+// Railway / most PaaS terminate TLS at a proxy; needed for correct client IPs
+// in rate limiting and for `secure` cookies.
+app.set("trust proxy", TRUST_PROXY);
+app.disable("x-powered-by");
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ---------------------------------------------------------------------------
-// Admin auth middleware for /setup routes
+// OAuth 2.1 authorization server (protects /mcp; used by the Claude connector)
 // ---------------------------------------------------------------------------
 
-function requireAdmin(req: Request, res: Response, next: NextFunction): void {
-  const key =
-    req.query.key as string | undefined ??
-    req.headers["x-admin-key"] as string | undefined;
+const authProvider = new GmailMcpAuthProvider({
+  secret: AUTH_SECRET,
+  adminPassword: ADMIN_PASSWORD,
+  allowedRedirectHosts: ALLOWED_REDIRECT_HOSTS,
+  serverUrl: SERVER_URL,
+});
 
-  if (key !== ADMIN_PASSWORD) {
-    res.status(401).send(`
-      <html><body style="font-family:system-ui;max-width:400px;margin:80px auto;text-align:center">
-        <h2>Admin Login</h2>
-        <form method="GET">
-          <input type="password" name="key" placeholder="Admin password" style="padding:8px;width:100%;box-sizing:border-box;margin-bottom:12px" />
-          <button type="submit" style="padding:8px 24px">Login</button>
-        </form>
-      </body></html>
-    `);
+// Brute-force protection for the two password forms.
+const passwordRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: "Too many attempts. Try again later.",
+});
+
+// Consent form target — registered before the SDK router so it takes priority.
+app.post("/authorize/login", passwordRateLimit, authProvider.handleConsent);
+
+// /.well-known/oauth-authorization-server, /.well-known/oauth-protected-resource/mcp,
+// /authorize, /token, /register
+app.use(
+  mcpAuthRouter({
+    provider: authProvider,
+    issuerUrl: new URL(SERVER_URL),
+    resourceServerUrl: MCP_URL,
+    resourceName: "Gmail MCP Server",
+    scopesSupported: ["gmail"],
+    clientRegistrationOptions: { clientSecretExpirySeconds: 0 },
+  })
+);
+
+// Some clients look up protected-resource metadata at the root path too.
+app.get("/.well-known/oauth-protected-resource", (_req, res) => {
+  res.json({
+    resource: MCP_URL.href,
+    authorization_servers: [new URL(SERVER_URL).href],
+    scopes_supported: ["gmail"],
+    resource_name: "Gmail MCP Server",
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Admin login (cookie session) — no password in query strings anymore
+// ---------------------------------------------------------------------------
+
+const requireAdmin = requireAdminSession(authProvider, "/setup/login");
+
+app.get("/setup/login", (req: Request, res: Response) => {
+  if (authProvider.verifySession(readCookie(req, SESSION_COOKIE))) {
+    res.redirect("/setup");
     return;
   }
-  next();
-}
+  res.set("Cache-Control", "no-store").type("html").send(renderLoginPage());
+});
+
+app.post("/setup/login", passwordRateLimit, (req: Request, res: Response) => {
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+  if (!safeEqual(password, ADMIN_PASSWORD)) {
+    res.status(401).set("Cache-Control", "no-store").type("html").send(renderLoginPage("Incorrect password."));
+    return;
+  }
+  setSessionCookie(res, authProvider.createSession(), SECURE_COOKIES);
+  res.redirect("/setup");
+});
+
+app.post("/setup/logout", requireAdmin, (_req: Request, res: Response) => {
+  clearSessionCookie(res);
+  res.redirect("/setup/login");
+});
 
 // ---------------------------------------------------------------------------
 // Setup page — manage connected Gmail accounts
 // ---------------------------------------------------------------------------
 
-app.get("/setup", requireAdmin, (_req: Request, res: Response) => {
+app.get("/setup", requireAdmin, (req: Request, res: Response) => {
   const accounts = tokenStore.listAccounts();
-  const key = _req.query.key as string;
-  const message = _req.query.message as string | undefined;
+  const message = typeof req.query.message === "string" ? req.query.message : undefined;
 
   const accountRows = accounts.length > 0
     ? accounts
         .map(
           (a) => `
         <tr>
-          <td>${a.email}</td>
+          <td>${escapeHtml(a.email)}</td>
           <td>${new Date(a.addedAt).toLocaleDateString()}</td>
           <td>
-            <form method="POST" action="/setup/remove?key=${encodeURIComponent(key)}" style="display:inline">
-              <input type="hidden" name="email" value="${a.email}" />
-              <button type="submit" onclick="return confirm('Remove ${a.email}?')" style="color:red;background:none;border:1px solid red;padding:4px 12px;cursor:pointer">Remove</button>
+            <form method="POST" action="/setup/remove" style="display:inline">
+              <input type="hidden" name="email" value="${escapeHtml(a.email)}" />
+              <button type="submit" onclick="return confirm('Remove this account?')" style="color:red;background:none;border:1px solid red;padding:4px 12px;cursor:pointer">Remove</button>
             </form>
           </td>
         </tr>`
@@ -393,7 +488,7 @@ app.get("/setup", requireAdmin, (_req: Request, res: Response) => {
         .join("")
     : `<tr><td colspan="3" style="text-align:center;color:#888">No accounts connected yet</td></tr>`;
 
-  res.send(`
+  res.set("Cache-Control", "no-store").send(`
     <!DOCTYPE html>
     <html>
     <head>
@@ -408,27 +503,29 @@ app.get("/setup", requireAdmin, (_req: Request, res: Response) => {
         .btn:hover { background: #3367d6; }
         .msg { padding: 12px; background: #e8f5e9; border-radius: 6px; margin-bottom: 16px; }
         .msg.error { background: #fce4ec; }
+        .logout { float: right; background: none; border: 1px solid #ccc; padding: 6px 12px; border-radius: 6px; cursor: pointer; }
       </style>
     </head>
     <body>
+      <form method="POST" action="/setup/logout"><button class="logout" type="submit">Log out</button></form>
       <h1>Gmail MCP Server — Setup</h1>
-      ${message ? `<div class="msg">${message}</div>` : ""}
+      ${message ? `<div class="msg">${escapeHtml(message)}</div>` : ""}
       <table>
         <thead><tr><th>Account</th><th>Added</th><th></th></tr></thead>
         <tbody>${accountRows}</tbody>
       </table>
-      <a class="btn" href="/oauth/start?key=${encodeURIComponent(key)}">+ Add Gmail Account</a>
+      <a class="btn" href="/oauth/start">+ Add Gmail Account</a>
       ${accounts.length > 0 ? `
       <div style="margin-top:24px;padding:16px;background:#fff3cd;border-radius:6px">
         <strong>Important:</strong> After adding/removing accounts, copy the value below and paste it as the <code>TOKENS_DATA</code> environment variable in Railway. This ensures accounts survive redeploys.
         <div style="margin-top:8px">
-          <textarea readonly style="width:100%;height:60px;font-family:monospace;font-size:11px;box-sizing:border-box" onclick="this.select()">${tokenStore.getTokensDataForExport()}</textarea>
+          <textarea readonly style="width:100%;height:60px;font-family:monospace;font-size:11px;box-sizing:border-box" onclick="this.select()">${escapeHtml(tokenStore.getTokensDataForExport())}</textarea>
         </div>
       </div>
       ` : ""}
       <hr style="margin-top:40px;border:none;border-top:1px solid #eee" />
       <p style="color:#888;font-size:13px">
-        MCP endpoint: <code>${SERVER_URL}/mcp</code><br/>
+        MCP endpoint: <code>${escapeHtml(MCP_URL.href)}</code> (OAuth protected — connect it from Claude and approve with the admin password)<br/>
         Connected accounts: ${accounts.length}
       </p>
     </body>
@@ -437,55 +534,55 @@ app.get("/setup", requireAdmin, (_req: Request, res: Response) => {
 });
 
 app.post("/setup/remove", requireAdmin, (req: Request, res: Response) => {
-  const email = req.body.email;
-  const key = req.query.key as string;
+  const email = typeof req.body?.email === "string" ? req.body.email : "";
 
   if (email && tokenStore.hasAccount(email)) {
     tokenStore.removeAccount(email);
-    res.redirect(`/setup?key=${encodeURIComponent(key)}&message=${encodeURIComponent(`Removed ${email}`)}`);
+    res.redirect(`/setup?message=${encodeURIComponent(`Removed ${email}`)}`);
   } else {
-    res.redirect(`/setup?key=${encodeURIComponent(key)}&message=${encodeURIComponent("Account not found")}`);
+    res.redirect(`/setup?message=${encodeURIComponent("Account not found")}`);
   }
 });
 
 // ---------------------------------------------------------------------------
-// OAuth flow — server-managed Google auth
+// Google OAuth flow — connects a Gmail account (admin only)
 // ---------------------------------------------------------------------------
 
-app.get("/oauth/start", (req: Request, res: Response) => {
-  const key = req.query.key as string;
-  if (key !== ADMIN_PASSWORD) {
-    res.status(401).send("Unauthorized");
-    return;
-  }
-
+app.get("/oauth/start", requireAdmin, (req: Request, res: Response) => {
+  const session = getAdminSession(req);
   const oauth2 = makeOAuth2Client();
   const url = oauth2.generateAuthUrl({
     access_type: "offline",
     prompt: "consent",
     scope: SCOPES,
-    state: key, // pass admin key through OAuth flow
+    state: authProvider.createGoogleState(session.sid),
   });
-
   res.redirect(url);
 });
 
-app.get("/oauth/callback", async (req: Request, res: Response) => {
-  const code = req.query.code as string;
-  const state = req.query.state as string;
-  const error = req.query.error as string;
+app.get("/oauth/callback", requireAdmin, async (req: Request, res: Response) => {
+  const session = getAdminSession(req);
+  const code = typeof req.query.code === "string" ? req.query.code : undefined;
+  const state = typeof req.query.state === "string" ? req.query.state : undefined;
+  const error = typeof req.query.error === "string" ? req.query.error : undefined;
+
+  const toSetup = (message: string) =>
+    res.redirect(`/setup?message=${encodeURIComponent(message)}`);
+
+  // The state is signed and bound to the admin session that started the flow,
+  // so a callback URL crafted by someone else cannot attach their account.
+  if (!authProvider.verifyGoogleState(state, session.sid)) {
+    toSetup("Invalid or expired OAuth state. Please try adding the account again.");
+    return;
+  }
 
   if (error) {
-    res.redirect(
-      `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent(`OAuth error: ${error}`)}`
-    );
+    toSetup(`OAuth error: ${error}`);
     return;
   }
 
   if (!code) {
-    res.redirect(
-      `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent("No authorization code received")}`
-    );
+    toSetup("No authorization code received");
     return;
   }
 
@@ -494,9 +591,7 @@ app.get("/oauth/callback", async (req: Request, res: Response) => {
     const { tokens } = await oauth2.getToken(code);
 
     if (!tokens.refresh_token) {
-      res.redirect(
-        `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent("No refresh token received. Try removing the app from your Google account permissions and re-adding.")}`
-      );
+      toSetup("No refresh token received. Try removing the app from your Google account permissions and re-adding.");
       return;
     }
 
@@ -507,39 +602,46 @@ app.get("/oauth/callback", async (req: Request, res: Response) => {
     const email = userInfo.data.email;
 
     if (!email) {
-      res.redirect(
-        `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent("Could not determine email address")}`
-      );
+      toSetup("Could not determine email address");
       return;
     }
 
     tokenStore.addAccount(email, tokens.refresh_token);
-
-    res.redirect(
-      `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent(`Successfully connected ${email}`)}`
-    );
+    toSetup(`Successfully connected ${email}`);
   } catch (err: any) {
     console.error("[oauth/callback] Error:", err);
-    res.redirect(
-      `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent(`Error: ${err.message}`)}`
-    );
+    toSetup(`Error: ${err.message}`);
   }
 });
 
 // ---------------------------------------------------------------------------
-// Health check
+// Health check — liveness only, reveals nothing about the deployment
 // ---------------------------------------------------------------------------
 
 app.get("/health", (_req, res) => {
-  res.json({
-    status: "ok",
-    accounts: tokenStore.size,
-  });
+  res.json({ status: "ok" });
 });
 
 // ---------------------------------------------------------------------------
 // MCP transport — Streamable HTTP (stateless: each request gets a fresh server)
+// Every method on /mcp requires a valid OAuth access token.
 // ---------------------------------------------------------------------------
+
+const mcpRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.use(
+  "/mcp",
+  mcpRateLimit,
+  requireBearerAuth({
+    verifier: authProvider,
+    resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(MCP_URL),
+  })
+);
 
 app.post("/mcp", async (req: Request, res: Response) => {
   try {
@@ -569,7 +671,7 @@ app.post("/mcp", async (req: Request, res: Response) => {
   }
 });
 
-app.get("/mcp", async (req: Request, res: Response) => {
+app.get("/mcp", async (_req: Request, res: Response) => {
   res.status(405).json({
     jsonrpc: "2.0",
     error: { code: -32000, message: "SSE streams not supported in stateless mode. Use POST." },
@@ -577,12 +679,17 @@ app.get("/mcp", async (req: Request, res: Response) => {
   });
 });
 
-app.delete("/mcp", async (req: Request, res: Response) => {
+app.delete("/mcp", async (_req: Request, res: Response) => {
   res.status(405).json({
     jsonrpc: "2.0",
     error: { code: -32000, message: "Session management not used in stateless mode." },
     id: null,
   });
+});
+
+// Anything else: 404 without leaking what exists.
+app.use((_req: Request, res: Response) => {
+  res.status(404).json({ error: "not_found" });
 });
 
 // ---------------------------------------------------------------------------
@@ -591,7 +698,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, () => {
   console.log(`Gmail MCP server listening on port ${PORT}`);
-  console.log(`  MCP endpoint:  ${SERVER_URL}/mcp`);
+  console.log(`  MCP endpoint:  ${MCP_URL.href} (OAuth 2.1 protected)`);
   console.log(`  Setup page:    ${SERVER_URL}/setup`);
   console.log(`  Health check:  ${SERVER_URL}/health`);
   console.log(`  Accounts:      ${tokenStore.size}`);
