@@ -257,6 +257,38 @@ function createMcpServer(): McpServer {
     }
   );
 
+  // ---- mark_as_read / mark_as_unread ----
+  for (const read of [true, false]) {
+    const name = read ? "mark_as_read" : "mark_as_unread";
+    server.tool(
+      name,
+      read
+        ? "Mark one or more emails as read (removes the UNREAD label)."
+        : "Mark one or more emails as unread (adds the UNREAD label).",
+      {
+        account: z.string().describe("Email address of the account these messages belong to"),
+        message_ids: z.array(z.string()).min(1).describe("Gmail message IDs to update"),
+      },
+      async ({ account, message_ids }) => {
+        const [email] = resolveAccounts(account);
+        const gmail = await getGmailServiceForAccount(email);
+        const result = await gmail.setRead(message_ids, read);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                account: email,
+                ...result,
+                message: `${result.modified} email(s) marked as ${read ? "read" : "unread"}.`,
+              }),
+            },
+          ],
+        };
+      }
+    );
+  }
+
   // ---- apply_label ----
   server.tool(
     "apply_label",

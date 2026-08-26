@@ -273,6 +273,30 @@ export class GmailService {
   }
 
   // -----------------------------------------------------------------------
+  // mark_as_read / mark_as_unread — toggle the UNREAD label
+  // -----------------------------------------------------------------------
+
+  async setRead(
+    messageIds: string[],
+    read: boolean
+  ): Promise<{ success: boolean; modified: number }> {
+    const ids = [...new Set(messageIds.map((id) => id.trim()).filter(Boolean))];
+    if (ids.length === 0) throw new Error("At least one message ID is required");
+
+    // batchModify accepts up to 1000 ids per call
+    for (let i = 0; i < ids.length; i += 1000) {
+      await this.gmail.users.messages.batchModify({
+        userId: "me",
+        requestBody: {
+          ids: ids.slice(i, i + 1000),
+          ...(read ? { removeLabelIds: ["UNREAD"] } : { addLabelIds: ["UNREAD"] }),
+        },
+      });
+    }
+    return { success: true, modified: ids.length };
+  }
+
+  // -----------------------------------------------------------------------
   // apply_label — create if needed, then apply
   // -----------------------------------------------------------------------
 

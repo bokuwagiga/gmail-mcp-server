@@ -64,6 +64,8 @@ This Gmail MCP server turns any MCP-compatible AI client into a full-featured em
 | `list_emails` | Search and list emails using Gmail query syntax. Supports `account="all"` |
 | `get_email` | Get full email content, headers, and parsed unsubscribe links |
 | `archive_email` | Archive an email by removing it from the inbox |
+| `mark_as_read` | Mark one or more emails as read |
+| `mark_as_unread` | Mark one or more emails as unread |
 | `apply_label` | Apply a label to an email. Creates the label if it doesn't exist |
 | `unsubscribe_email` | Auto-unsubscribe from mailing lists and newsletters |
 | `batch_process` | Fetch a batch of emails for triage. Supports `account="all"` |
@@ -335,7 +337,7 @@ Want to help make this better? Here are some open ideas:
 - [ ] Add HTML bodies and attachments to outgoing messages
 - [ ] Add email attachment download support
 - [ ] Add `delete_email` tool
-- [ ] Add `mark_as_read` / `mark_as_unread` tools
+- [x] Add `mark_as_read` / `mark_as_unread` tools
 - [ ] Add `remove_label` tool
 - [ ] Add support for Google Workspace accounts
 
