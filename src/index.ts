@@ -372,6 +372,140 @@ function createMcpServer(): McpServer {
     }
   );
 
+  // ---- send_message ----
+  server.tool(
+    "send_message",
+    "Send a new email immediately from one of the connected accounts. This cannot be undone — if the user wants to review it first, use create_draft instead.",
+    {
+      account: z.string().describe("Email address of the connected account to send from"),
+      to: z.array(z.string()).min(1).describe("Recipient email addresses"),
+      cc: z.array(z.string()).optional().describe("CC recipients"),
+      bcc: z.array(z.string()).optional().describe("BCC recipients"),
+      subject: z.string().describe("Email subject"),
+      body: z.string().describe("Plain-text email body"),
+    },
+    async ({ account, to, cc, bcc, subject, body }) => {
+      const [email] = resolveAccounts(account);
+      const gmail = await getGmailServiceForAccount(email);
+      const result = await gmail.sendMessage({ to, cc, bcc, subject, body });
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account: email, ...result, message: `Email sent to ${to.join(", ")}.` }),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- reply ----
+  server.tool(
+    "reply",
+    "Reply to an existing email in the same thread. Recipients, subject (Re:) and threading headers are derived from the original message. Sends immediately — use create_draft with reply_to_message_id to prepare a reply without sending.",
+    {
+      account: z.string().describe("Email address of the account the original message belongs to"),
+      message_id: z.string().describe("The Gmail message ID to reply to"),
+      body: z.string().describe("Plain-text reply body"),
+      reply_all: z
+        .boolean()
+        .default(false)
+        .describe("Reply to all original recipients (To + Cc) instead of only the sender"),
+    },
+    async ({ account, message_id, body, reply_all }) => {
+      const [email] = resolveAccounts(account);
+      const gmail = await getGmailServiceForAccount(email);
+      const result = await gmail.reply(message_id, body, email, reply_all);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account: email, ...result, message: `Reply sent in thread ${result.threadId}.` }),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- forward ----
+  server.tool(
+    "forward",
+    "Forward an existing email to other recipients, optionally with a note above the forwarded content. Sends immediately.",
+    {
+      account: z.string().describe("Email address of the account the original message belongs to"),
+      message_id: z.string().describe("The Gmail message ID to forward"),
+      to: z.array(z.string()).min(1).describe("Recipient email addresses"),
+      body: z.string().optional().describe("Optional note to include above the forwarded message"),
+    },
+    async ({ account, message_id, to, body }) => {
+      const [email] = resolveAccounts(account);
+      const gmail = await getGmailServiceForAccount(email);
+      const result = await gmail.forward(message_id, to, body);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account: email, ...result, message: `Email forwarded to ${to.join(", ")}.` }),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- create_draft ----
+  server.tool(
+    "create_draft",
+    "Create a draft without sending it, so the user can review and send it from Gmail. Pass reply_to_message_id to draft a reply inside an existing thread (recipients and subject are then derived from that message unless overridden).",
+    {
+      account: z.string().describe("Email address of the connected account the draft belongs to"),
+      to: z.array(z.string()).optional().describe("Recipient email addresses (required unless reply_to_message_id is given)"),
+      cc: z.array(z.string()).optional().describe("CC recipients"),
+      bcc: z.array(z.string()).optional().describe("BCC recipients"),
+      subject: z.string().optional().describe("Email subject (required unless reply_to_message_id is given)"),
+      body: z.string().describe("Plain-text draft body"),
+      reply_to_message_id: z
+        .string()
+        .optional()
+        .describe("Gmail message ID to reply to; the draft is threaded under it"),
+      reply_all: z.boolean().default(false).describe("When drafting a reply, include all original recipients"),
+    },
+    async ({ account, to, cc, bcc, subject, body, reply_to_message_id, reply_all }) => {
+      const [email] = resolveAccounts(account);
+      const gmail = await getGmailServiceForAccount(email);
+
+      let draftMessage;
+      if (reply_to_message_id) {
+        const composed = await gmail.composeReply(reply_to_message_id, body, email, reply_all);
+        draftMessage = {
+          ...composed,
+          to: to && to.length > 0 ? to : composed.to,
+          cc: cc ?? composed.cc,
+          bcc,
+          subject: subject ?? composed.subject,
+        };
+      } else {
+        if (!to || to.length === 0) throw new Error("'to' is required when not replying to a message");
+        draftMessage = { to, cc, bcc, subject: subject ?? "", body };
+      }
+
+      const result = await gmail.createDraft(draftMessage);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              account: email,
+              ...result,
+              to: draftMessage.to,
+              subject: draftMessage.subject,
+              message: "Draft saved. It has NOT been sent — the user can review and send it from Gmail.",
+            }),
+          },
+        ],
+      };
+    }
+  );
+
   return server;
 }
 

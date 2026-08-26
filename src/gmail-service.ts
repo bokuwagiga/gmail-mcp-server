@@ -34,6 +34,128 @@ export interface UnsubscribeResult {
   detail: string;
 }
 
+export interface OutgoingMessage {
+  to: string[];
+  cc?: string[];
+  bcc?: string[];
+  subject: string;
+  body: string;
+  /** Gmail thread to attach the message to (replies/forwards). */
+  threadId?: string;
+  /** Message-ID header of the message being replied to. */
+  inReplyTo?: string;
+  /** References header chain for threading. */
+  references?: string;
+}
+
+export interface SentMessage {
+  id: string;
+  threadId: string;
+}
+
+export interface DraftInfo {
+  draftId: string;
+  messageId: string;
+  threadId: string;
+}
+
+// ---------------------------------------------------------------------------
+// Pure helpers for composing messages (exported for testing)
+// ---------------------------------------------------------------------------
+
+/** Strip CR/LF so a user-supplied value cannot inject extra MIME headers. */
+function headerSafe(value: string): string {
+  return value.replace(/[\r\n]+/g, " ").trim();
+}
+
+/** RFC 2047 encode a header value if it contains non-ASCII characters. */
+export function encodeHeaderValue(value: string): string {
+  const clean = headerSafe(value);
+  // eslint-disable-next-line no-control-regex
+  if (/^[\x20-\x7e]*$/.test(clean)) return clean;
+  return `=?UTF-8?B?${Buffer.from(clean, "utf8").toString("base64")}?=`;
+}
+
+/**
+ * Build an RFC 2822 message and return it base64url-encoded, as required by
+ * the Gmail API's `raw` field. Plain-text body, UTF-8, base64 transfer
+ * encoding (safe for any content and line length).
+ */
+export function buildRawMessage(msg: OutgoingMessage): string {
+  const lines: string[] = [];
+  const addr = (list?: string[]) => (list ?? []).map(headerSafe).filter(Boolean).join(", ");
+
+  const to = addr(msg.to);
+  if (!to) throw new Error("At least one recipient is required");
+  lines.push(`To: ${to}`);
+  const cc = addr(msg.cc);
+  if (cc) lines.push(`Cc: ${cc}`);
+  const bcc = addr(msg.bcc);
+  if (bcc) lines.push(`Bcc: ${bcc}`);
+  lines.push(`Subject: ${encodeHeaderValue(msg.subject)}`);
+  if (msg.inReplyTo) lines.push(`In-Reply-To: ${headerSafe(msg.inReplyTo)}`);
+  if (msg.references) lines.push(`References: ${headerSafe(msg.references)}`);
+  lines.push("MIME-Version: 1.0");
+  lines.push('Content-Type: text/plain; charset="UTF-8"');
+  lines.push("Content-Transfer-Encoding: base64");
+  lines.push("");
+  // Wrap base64 body at 76 chars per RFC 2045
+  const b64 = Buffer.from(msg.body, "utf8").toString("base64");
+  lines.push(...(b64.match(/.{1,76}/g) ?? [""]));
+
+  return Buffer.from(lines.join("\r\n")).toString("base64url");
+}
+
+/** Extract bare email addresses from a header like `"Name" <a@b.c>, d@e.f`. */
+export function parseAddresses(header: string | undefined): string[] {
+  if (!header) return [];
+  const out: string[] = [];
+  for (const part of header.split(",")) {
+    const m = part.match(/<([^>]+)>/) ?? part.match(/([^\s"<>,]+@[^\s"<>,]+)/);
+    if (m) out.push(m[1].trim());
+  }
+  return out;
+}
+
+/**
+ * Work out who a reply goes to. Honors Reply-To, drops our own address, and
+ * de-duplicates case-insensitively.
+ */
+export function computeReplyRecipients(
+  headers: Record<string, string>,
+  selfEmail: string,
+  replyAll: boolean
+): { to: string[]; cc: string[] } {
+  const self = selfEmail.toLowerCase();
+  const seen = new Set<string>([self]);
+  const uniq = (addrs: string[]) =>
+    addrs.filter((a) => {
+      const k = a.toLowerCase();
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+
+  const hdr = (name: string) =>
+    Object.entries(headers).find(([k]) => k.toLowerCase() === name.toLowerCase())?.[1];
+
+  const replyTarget = parseAddresses(hdr("Reply-To") || hdr("From"));
+  const to = uniq(replyTarget);
+  if (!replyAll) {
+    return { to: to.length > 0 ? to : uniq(parseAddresses(hdr("From"))), cc: [] };
+  }
+  // Reply-all: original To + Cc go to Cc (minus self and the primary recipient)
+  const cc = uniq([...parseAddresses(hdr("To")), ...parseAddresses(hdr("Cc"))]);
+  return { to, cc };
+}
+
+/** Prefix a subject with Re:/Fwd: unless it already carries that prefix. */
+export function prefixSubject(subject: string, prefix: "Re" | "Fwd"): string {
+  const s = subject.trim();
+  const re = prefix === "Re" ? /^(re|aw|sv)\s*:/i : /^(fwd?|wg|tr)\s*:/i;
+  return re.test(s) ? s : `${prefix}: ${s}`;
+}
+
 // ---------------------------------------------------------------------------
 // Gmail Service — one instance per access token (per session)
 // ---------------------------------------------------------------------------
@@ -322,6 +444,105 @@ export class GmailService {
     maxResults: number = 20
   ): Promise<EmailSummary[]> {
     return this.listEmails(query, maxResults);
+  }
+
+  // -----------------------------------------------------------------------
+  // send_message — send a new email immediately
+  // -----------------------------------------------------------------------
+
+  async sendMessage(msg: OutgoingMessage): Promise<SentMessage> {
+    const res = await this.gmail.users.messages.send({
+      userId: "me",
+      requestBody: { raw: buildRawMessage(msg), threadId: msg.threadId },
+    });
+    return { id: res.data.id!, threadId: res.data.threadId! };
+  }
+
+  // -----------------------------------------------------------------------
+  // create_draft — save without sending (optionally as a reply in a thread)
+  // -----------------------------------------------------------------------
+
+  async createDraft(msg: OutgoingMessage): Promise<DraftInfo> {
+    const res = await this.gmail.users.drafts.create({
+      userId: "me",
+      requestBody: {
+        message: { raw: buildRawMessage(msg), threadId: msg.threadId },
+      },
+    });
+    return {
+      draftId: res.data.id!,
+      messageId: res.data.message?.id ?? "",
+      threadId: res.data.message?.threadId ?? msg.threadId ?? "",
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // reply / forward — build a threaded message from an existing one
+  // -----------------------------------------------------------------------
+
+  /**
+   * Compose a reply to `messageId`. Returns the OutgoingMessage so the caller
+   * can either send it or save it as a draft.
+   */
+  async composeReply(
+    messageId: string,
+    body: string,
+    selfEmail: string,
+    replyAll: boolean
+  ): Promise<OutgoingMessage> {
+    const original = await this.getEmail(messageId);
+    const { to, cc } = computeReplyRecipients(original.headers, selfEmail, replyAll);
+    if (to.length === 0) {
+      throw new Error(`Could not determine a reply recipient for message ${messageId}`);
+    }
+
+    const messageIdHeader = original.headers["Message-ID"] ?? original.headers["Message-Id"] ?? "";
+    const references = [original.headers["References"], messageIdHeader]
+      .filter(Boolean)
+      .join(" ");
+
+    return {
+      to,
+      cc,
+      subject: prefixSubject(original.subject, "Re"),
+      body,
+      threadId: original.threadId,
+      inReplyTo: messageIdHeader || undefined,
+      references: references || undefined,
+    };
+  }
+
+  async reply(
+    messageId: string,
+    body: string,
+    selfEmail: string,
+    replyAll: boolean
+  ): Promise<SentMessage> {
+    return this.sendMessage(await this.composeReply(messageId, body, selfEmail, replyAll));
+  }
+
+  async forward(
+    messageId: string,
+    to: string[],
+    note: string | undefined
+  ): Promise<SentMessage> {
+    const original = await this.getEmail(messageId);
+    const forwardedBlock = [
+      "---------- Forwarded message ---------",
+      `From: ${original.from}`,
+      `Date: ${original.date}`,
+      `Subject: ${original.subject}`,
+      `To: ${original.to}`,
+      "",
+      original.body,
+    ].join("\n");
+
+    return this.sendMessage({
+      to,
+      subject: prefixSubject(original.subject, "Fwd"),
+      body: note ? `${note}\n\n${forwardedBlock}` : forwardedBlock,
+      threadId: original.threadId,
+    });
   }
 
   // -----------------------------------------------------------------------

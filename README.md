@@ -47,7 +47,7 @@ This Gmail MCP server turns any MCP-compatible AI client into a full-featured em
 ## Gmail MCP Server Features
 
 - **Multi-account support.** Connect multiple Gmail accounts and switch between them, or query all at once.
-- **Full read and write access.** Not just reading emails. Archive, label, modify, and unsubscribe.
+- **Full read and write access.** Not just reading emails. Send, reply, forward, draft, archive, label, and unsubscribe.
 - **Gmail search syntax.** Use Gmail's query language: `is:unread`, `from:`, `newer_than:7d`, `has:attachment`, and more.
 - **Auto-unsubscribe.** Finds and triggers unsubscribe links automatically. Supports List-Unsubscribe headers, mailto links, and body link scanning.
 - **Batch operations.** Fetch batches of emails for AI-powered triage and bulk actions.
@@ -67,6 +67,10 @@ This Gmail MCP server turns any MCP-compatible AI client into a full-featured em
 | `apply_label` | Apply a label to an email. Creates the label if it doesn't exist |
 | `unsubscribe_email` | Auto-unsubscribe from mailing lists and newsletters |
 | `batch_process` | Fetch a batch of emails for triage. Supports `account="all"` |
+| `send_message` | Send a new email (to/cc/bcc, subject, plain-text body) |
+| `reply` | Reply (or reply-all) to a message in its thread, with proper `In-Reply-To`/`References` headers |
+| `forward` | Forward a message to other recipients, optionally with a note |
+| `create_draft` | Save a draft instead of sending — new message or a threaded reply — for the user to review in Gmail |
 
 ---
 
@@ -308,8 +312,9 @@ The `list_emails` and `batch_process` tools accept Gmail's full search syntax:
 
 Want to help make this better? Here are some open ideas:
 
-- [ ] Add `send_email` tool for composing and sending emails
-- [ ] Add `reply_to_email` tool
+- [x] Add `send_message` tool for composing and sending emails
+- [x] Add `reply` / `forward` / `create_draft` tools
+- [ ] Add HTML bodies and attachments to outgoing messages
 - [ ] Add email attachment download support
 - [ ] Add `delete_email` tool
 - [ ] Add `mark_as_read` / `mark_as_unread` tools
