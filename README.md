@@ -136,6 +136,24 @@ npm run build
 npm start
 ```
 
+##### Run at boot on Windows
+
+Self-hosting on a Windows machine? After `npm run build` and creating `.env`, register a Scheduled Task from an **elevated** PowerShell:
+
+```powershell
+.\scripts\install-windows-task.ps1            # runs as your user (asks for your password once)
+.\scripts\install-windows-task.ps1 -AsSystem  # or run as LOCAL SYSTEM
+```
+
+The task starts `node --env-file=.env dist\index.js` at boot, restarts it if it crashes, never times out, and writes output to `logs\server.log`. After pulling an update, rebuild and restart it:
+
+```powershell
+git pull; npm run build
+Stop-ScheduledTask -TaskName "Gmail MCP Server"; Start-ScheduledTask -TaskName "Gmail MCP Server"
+```
+
+Remove it with `.\scripts\install-windows-task.ps1 -Uninstall`.
+
 #### Option C: Docker
 
 ```bash
