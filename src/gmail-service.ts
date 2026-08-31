@@ -317,6 +317,43 @@ export class GmailService {
     return { success: true, labelId };
   }
 
+  // -----------------------------------------------------------------------
+  // remove_label — strip a label by name from one or more messages
+  // -----------------------------------------------------------------------
+
+  async removeLabel(
+    messageIds: string[],
+    labelName: string
+  ): Promise<{ success: boolean; labelId: string | null; modified: number }> {
+    const ids = [...new Set(messageIds.map((id) => id.trim()).filter(Boolean))];
+    if (ids.length === 0) throw new Error("At least one message ID is required");
+
+    const labelId = await this.findLabelId(labelName);
+    if (!labelId) {
+      // Nothing to remove — treat as a no-op rather than an error.
+      return { success: true, labelId: null, modified: 0 };
+    }
+
+    for (let i = 0; i < ids.length; i += 1000) {
+      await this.gmail.users.messages.batchModify({
+        userId: "me",
+        requestBody: { ids: ids.slice(i, i + 1000), removeLabelIds: [labelId] },
+      });
+    }
+    return { success: true, labelId, modified: ids.length };
+  }
+
+  /** Resolve a label by name (case-insensitive) or by ID. Returns null if absent. */
+  private async findLabelId(labelName: string): Promise<string | null> {
+    const res = await this.gmail.users.labels.list({ userId: "me" });
+    const labels = res.data.labels ?? [];
+    const wanted = labelName.trim().toLowerCase();
+    const match = labels.find(
+      (l) => l.name?.toLowerCase() === wanted || l.id?.toLowerCase() === wanted
+    );
+    return match?.id ?? null;
+  }
+
   private async getOrCreateLabel(labelName: string): Promise<string> {
     // Check existing labels
     const res = await this.gmail.users.labels.list({ userId: "me" });

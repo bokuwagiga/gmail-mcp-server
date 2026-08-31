@@ -322,6 +322,36 @@ function createMcpServer(): McpServer {
     }
   );
 
+  // ---- remove_label ----
+  server.tool(
+    "remove_label",
+    "Remove a label from one or more emails. The label is matched by name (case-insensitive) or ID; if it does not exist nothing is changed.",
+    {
+      account: z.string().describe("Email address of the account these messages belong to"),
+      message_ids: z.array(z.string()).min(1).describe("Gmail message IDs to update"),
+      label_name: z.string().describe("Label name to remove (e.g. 'ManualCheck')"),
+    },
+    async ({ account, message_ids, label_name }) => {
+      const [email] = resolveAccounts(account);
+      const gmail = await getGmailServiceForAccount(email);
+      const result = await gmail.removeLabel(message_ids, label_name);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              account: email,
+              ...result,
+              message: result.labelId
+                ? `Label "${label_name}" removed from ${result.modified} email(s).`
+                : `Label "${label_name}" does not exist in this account; nothing to remove.`,
+            }),
+          },
+        ],
+      };
+    }
+  );
+
   // ---- unsubscribe_email ----
   server.tool(
     "unsubscribe_email",
