@@ -819,6 +819,53 @@ app.get("/health", (_req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Public landing + privacy pages. Static, no data. Google requires a homepage
+// URL and a privacy policy URL on the OAuth app's own domain to publish the
+// consent screen to production.
+// ---------------------------------------------------------------------------
+
+const PUBLIC_PAGE_STYLE =
+  "font-family:system-ui,sans-serif;max-width:640px;margin:60px auto;padding:0 20px;color:#222;line-height:1.6";
+
+app.get("/", (_req, res) => {
+  res.type("html").send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Gmail MCP Server</title></head>
+<body style="${PUBLIC_PAGE_STYLE}">
+  <h1>Gmail MCP Server</h1>
+  <p>A private, self-hosted <a href="https://modelcontextprotocol.io">Model Context Protocol</a>
+  server that lets the owner's AI assistant manage their own Gmail accounts.</p>
+  <p>Access requires authorization by the server's administrator.
+  See the <a href="/privacy">privacy policy</a>.</p>
+</body></html>`);
+});
+
+app.get("/privacy", (_req, res) => {
+  res.type("html").send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Privacy Policy — Gmail MCP Server</title></head>
+<body style="${PUBLIC_PAGE_STYLE}">
+  <h1>Privacy Policy</h1>
+  <p>This is a private, self-hosted application operated by its owner for personal use.
+  It is not offered as a service to the public.</p>
+  <h2>What data it accesses</h2>
+  <p>With the owner's explicit Google authorization, it reads and modifies Gmail messages
+  in the owner's own accounts via the Gmail API (scopes: <code>gmail.readonly</code>,
+  <code>gmail.modify</code>, <code>userinfo.email</code>).</p>
+  <h2>What data it stores</h2>
+  <p>Only Google OAuth refresh tokens and account email addresses, encrypted at rest
+  (AES-256-GCM) on the owner's server. No email content is stored. No data is shared with,
+  sold to, or disclosed to any third party.</p>
+  <h2>Revoking access</h2>
+  <p>Access can be revoked at any time from
+  <a href="https://myaccount.google.com/permissions">Google Account permissions</a>,
+  which immediately invalidates the stored tokens.</p>
+  <h2>Google API Services compliance</h2>
+  <p>Use of information received from Google APIs adheres to the
+  <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API
+  Services User Data Policy</a>, including the Limited Use requirements.</p>
+</body></html>`);
+});
+
+// ---------------------------------------------------------------------------
 // MCP transport — Streamable HTTP (stateless: each request gets a fresh server)
 // Every method on /mcp requires a valid OAuth access token.
 // ---------------------------------------------------------------------------
